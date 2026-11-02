@@ -1,0 +1,6 @@
+build/
+*.log
+*.db
+.venv/
+__pycache__/
+perf.data*
