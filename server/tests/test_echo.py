@@ -8,7 +8,7 @@
 
 需要 server 的 PID：fd 泄漏和内存增长两项读取 /proc/<pid>/。全部通过时退出码为 0。
 """
-import hashlib, os, socket, struct, sys, threading, time
+import hashlib, os, selectors, socket, struct, sys, threading, time
 
 PID = int(sys.argv[1])
 ADDR = ("127.0.0.1", int(sys.argv[2]) if len(sys.argv) > 2 else 8888)
@@ -64,6 +64,57 @@ def test_many_clients():
         assert recv_n(s, 5) == f"c{i:04}".encode()
     for s in clients:
         s.close()
+
+
+def test_1000_clients_large_concurrent():
+    # W2 验收：1000 个连接同时在线，每个发 256KB 左右的不同数据（远超 64KB 高水位），边发边收，逐字节比对。
+    # 用单线程 selectors 驱动全部连接：不能“先全发完再收”，那样两边的发送缓冲区都会被塞满，互相等着对方读，卡死。
+    N, BASE = 1000, 256 * 1024
+    big = memoryview(os.urandom(BASE + 2 * N))  # 共用一块随机数据，避免 1000 × 256KB 占满内存
+    sel = selectors.DefaultSelector()
+    state = {}
+    for i in range(N):
+        s = conn(10)
+        s.setblocking(False)
+        # 起点和长度都不同 → 每个连接的内容都不一样：串连接、错位、截断都能被查出来
+        state[s] = {"data": big[i:i + BASE + i], "sent": 0, "got": 0, "id": i}
+        sel.register(s, selectors.EVENT_READ | selectors.EVENT_WRITE)
+
+    pending, deadline = N, time.time() + 60
+    while pending:
+        if time.time() > deadline:
+            stuck = sorted(st["id"] for st in state.values() if st["got"] < len(st["data"]))
+            raise AssertionError(f"{len(stuck)} 个连接超时未收全，例如 {stuck[:5]}")
+        for key, ev in sel.select(timeout=1):
+            s, st = key.fileobj, state[key.fileobj]
+            data = st["data"]
+            if ev & selectors.EVENT_WRITE and st["sent"] < len(data):
+                try:
+                    # 把剩余数据整段交给内核：数据一大批到达，然后客户端停下来等回显。
+                    # ET 的“少读一次”或“欠一次通知”只有在没有后续数据补发通知时才会卡住；
+                    # 如果每次只发 64KB 小块，新数据不断到来，会把这类 bug 掩盖掉。
+                    st["sent"] += s.send(data[st["sent"]:])
+                except BlockingIOError:
+                    pass
+                if st["sent"] == len(data):  # 发完就不再关心可写，否则 select 会一直报可写
+                    sel.modify(s, selectors.EVENT_READ)
+            if ev & selectors.EVENT_READ:
+                try:
+                    chunk = s.recv(65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise AssertionError(f"conn {st['id']} 被提前关闭，只收到 {st['got']}/{len(data)}")
+                # 和期望的那一段直接比较，不用把收到的数据存下来（1000 × 96KB 太占内存）
+                exp = data[st["got"]:st["got"] + len(chunk)]
+                if chunk != exp:
+                    raise AssertionError(f"conn {st['id']} 在偏移 {st['got']} 处数据不一致")
+                st["got"] += len(chunk)
+                if st["got"] == len(data):
+                    sel.unregister(s)
+                    s.close()
+                    pending -= 1
+    sel.close()
 
 
 def test_half_close():
