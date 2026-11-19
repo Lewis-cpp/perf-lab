@@ -2,9 +2,12 @@
 """epoll echo 黑盒测试。
 
 用法（在 server/ 目录下）：
-  g++ -std=c++17 -g -Wall -Wextra -fsanitize=address,undefined -o build/echo_asan src/main.cpp
-  ./build/echo_asan &
-  python3 tests/test_echo.py $(pgrep -x echo_asan) [port]   # port 默认 8888
+  cmake -S . -B build -DCMAKE_CXX_FLAGS="-g -fsanitize=address,undefined" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+  cmake --build build --target server
+  ./build/server & SP=$!
+  python3 tests/test_echo.py $SP [port]   # port 默认 8888
+  （用 $! 拿 PID：机器上可能还有别的叫 server 的进程，pgrep -x server 会拿到多个）
 
 需要 server 的 PID：fd 泄漏和内存增长两项读取 /proc/<pid>/。全部通过时退出码为 0。
 """
@@ -156,6 +159,21 @@ def test_no_fd_leak():
     time.sleep(0.2)
     after = nfds()
     assert after == before, f"fd {before} -> {after}"
+
+
+def test_no_fd_leak_burst_close():
+    # 同一轮 epoll_wait 里有多个连接关闭：延迟销毁必须把每一个都收走，而不是只收第一个
+    time.sleep(0.2)
+    before = nfds()
+    socks = [conn() for _ in range(200)]
+    for s in socks:
+        s.sendall(b"b")
+        recv_n(s, 1)
+    for s in socks:
+        s.close()
+    time.sleep(1.0)
+    after = nfds()
+    assert after == before, f"fd {before} -> {after} (leaked {after - before} after burst close)"
 
 
 def test_slow_client_does_not_block_others():
