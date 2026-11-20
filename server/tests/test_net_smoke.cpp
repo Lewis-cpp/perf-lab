@@ -137,9 +137,9 @@ static void testNestedQueue() {
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0).count();
 
-  CHECK(ran == kNested);
-  // 嵌套任务要等下一轮：下一轮先阻塞在 poll（无事件时 1000ms 超时）。这是已知的捷径，阶段三用 eventfd 解决
-  std::printf("nested tasks ran=%d, took %.0f ms (expect ~1000ms: waited one poll timeout)\n", ran, ms);
+  // 阶段三起：doPendingFunctors 期间排的任务会 wakeup()，下一轮 poll 立刻返回，不再等 1000ms 超时
+  std::printf("nested tasks ran=%d, took %.1f ms (expect <100ms: eventfd wakeup)\n", ran, ms);
+  CHECK(ran == kNested && ms < 100);
   chA.remove();
   for (int fd : {a[0], a[1]}) close(fd);
   std::printf("PASS nested_queue\n");

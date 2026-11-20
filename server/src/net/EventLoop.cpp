@@ -1,23 +1,50 @@
 #include "net/EventLoop.h"
 #include "net/Channel.h"
 #include "net/Poller.h"
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <sys/eventfd.h>
+#include <sys/types.h>
+#include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
-EventLoop::EventLoop() : p_(std::make_unique<Poller>()) {}
+EventLoop::EventLoop()
+    : p_(std::make_unique<Poller>()), threadId_(std::this_thread::get_id()),
+      wakeupFd_(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+      wakeupChannel_(std::make_unique<Channel>(this, wakeupFd_)) {
+  if (wakeupFd_ < 0) {
+    std::perror("set wakeupFd failed.");
+    abort();
+  }
+  wakeupChannel_->setReadCallback([this]() { handleWakeup(); });
+  if (!wakeupChannel_->enableReading()) {
+    std::perror("wakeupChannel enableReading() failed.");
+    abort();
+  }
+}
 
-// 必须在 .cpp 里定义：让 std::unique_ptr<Poller> 析构时能看到完整的 Poller 类型定义
-EventLoop::~EventLoop() = default;
+// 必须在 .cpp 里定义：让 std::unique_ptr<Poller> 析构时能看到完整的 Poller
+// 类型定义
+EventLoop::~EventLoop() {
+  wakeupChannel_->remove();
+  ::close(wakeupFd_);
+}
 
 void EventLoop::doPendingFunctors() {
-  // shortcut：执行期间新排的任务要等下一轮 poll（最多阻塞 1s），后续接 eventfd 唤醒时一并解决
-  if (pendingFunctors_.empty())
-    return;
-  // 用 swap 换到栈局部变量，防止回调内部再调 queueInLoop() 时 vector 扩容导致迭代器失效或吞掉新任务
+  // 用 swap 换到栈局部变量，防止回调内部再调 queueInLoop() 时 vector
+  // 扩容导致迭代器失效或吞掉新任务
   std::vector<std::function<void()>> tmp;
-  std::swap(tmp, pendingFunctors_);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::swap(tmp, pendingFunctors_);
+  }
   for (auto &task : tmp) {
     if (task)
       task();
@@ -25,25 +52,79 @@ void EventLoop::doPendingFunctors() {
 }
 
 void EventLoop::loop() {
+  assertInLoopThread();
   while (!quit_) {
-    // 每轮 poll 前必须清零 size（保留堆容量），防止重放上一轮旧指针或踩到已销毁连接的野指针
+    // 每轮 poll 前必须清零
+    // size（保留堆容量），防止重放上一轮旧指针或踩到已销毁连接的野指针
     activeChannels_.clear();
     p_->poll(activeChannels_);
+    eventHandling_ = true;
     for (Channel *channel : activeChannels_) {
       channel->handleEvent();
     }
+    eventHandling_ = false;
     doPendingFunctors();
   }
 }
 
-void EventLoop::quit() { quit_.store(true); }
+void EventLoop::quit() {
+  quit_.store(true);
+  if (!isInLoopThread())
+    wakeup();
+}
 
 bool EventLoop::updateChannel(Channel *channel) {
+  assertInLoopThread();
   return p_->updateChannel(channel);
 }
 
-void EventLoop::removeChannel(Channel *channel) { p_->removeChannel(channel); }
+void EventLoop::removeChannel(Channel *channel) {
+  assertInLoopThread();
+  p_->removeChannel(channel);
+}
 
-void EventLoop::queueInLoop(std::function<void()> cb) {
-  pendingFunctors_.push_back(std::move(cb));
+void EventLoop::queueInLoop(Functor cb) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pendingFunctors_.push_back(std::move(cb));
+  }
+  if (!isInLoopThread() || !eventHandling_)
+    wakeup();
+}
+
+void EventLoop::handleWakeup() {
+  uint64_t one = 0;
+  ssize_t n = read(wakeupFd_, &one, 8);
+  if (n != 8 && errno != EAGAIN) {
+    std::perror("handleWakeup failed.");
+  }
+}
+
+void EventLoop::wakeup() {
+  uint64_t one = 1;
+  ssize_t n = write(wakeupFd_, &one, 8);
+  if (n != 8) {
+    std::perror("wakeup() func failed.");
+  }
+}
+
+bool EventLoop::isInLoopThread() const {
+  return std::this_thread::get_id() == threadId_;
+}
+
+void EventLoop::assertInLoopThread() const {
+  if (!isInLoopThread()) {
+    std::fprintf(stderr, "EventLoop::assertInLoopThread failed!\n");
+    abort();
+  }
+}
+
+void EventLoop::runInLoop(Functor cb) {
+  if (!cb)
+    return;
+  if (isInLoopThread())
+    cb();
+  else {
+    queueInLoop(std::move(cb));
+  }
 }

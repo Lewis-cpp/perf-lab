@@ -30,3 +30,10 @@ add_executable(acceptor_smoke EXCLUDE_FROM_ALL tests/test_acceptor_smoke.cpp)
 target_link_libraries(acceptor_smoke PRIVATE net)
 target_compile_options(acceptor_smoke PRIVATE -Wall -Wextra -fsanitize=address,undefined)
 target_link_options(acceptor_smoke PRIVATE -fsanitize=address,undefined)
+
+# W2 阶段三：eventfd 唤醒 / runInLoop / 多线程投递（TSan，所以 net 源码要单独带 TSan 重编，不复用 libnet.a）
+add_executable(wakeup_smoke EXCLUDE_FROM_ALL tests/test_wakeup.cpp
+  src/net/Channel.cpp src/net/EventLoop.cpp src/net/Poller.cpp)
+target_include_directories(wakeup_smoke PRIVATE src)
+target_compile_options(wakeup_smoke PRIVATE -Wall -Wextra -fsanitize=thread)
+target_link_options(wakeup_smoke PRIVATE -fsanitize=thread)
