@@ -73,8 +73,7 @@ void Acceptor::listen() {
 
 void Acceptor::handleRead() {
   while (true) {
-    // accept4 一步焊死 SOCK_NONBLOCK | SOCK_CLOEXEC（新 fd 不继承 listenFd_
-    // 的非阻塞标志）
+    // accept4 一步焊死 SOCK_NONBLOCK | SOCK_CLOEXEC（新 fd 不继承 listenFd_ 的非阻塞标志）
     int conn_fd =
         accept4(listenFd_, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (conn_fd == -1) {
@@ -86,11 +85,9 @@ void Acceptor::handleRead() {
       if (errno == EINTR || errno == ECONNABORTED || errno == EPROTO)
         continue;
       if (errno == EMFILE || errno == ENFILE) {
-        // 【备胎救急闭环】fd 配额耗尽时，腾出 idleFd_ 坑位，用独立 tmp_fd
-        // 取出队头连接立刻 close()：
-        //   1) 绝不直接用 idleFd_ 覆盖保存，避免产生无人管理的“孤儿泄漏
-        //   fd”且永久丢掉备胎； 2) 必须凭 accept() 的 tmp_fd >= 0 与 idleFd_ !=
-        //   -1 决定是否继续，
+        // 【备胎救急闭环】fd 配额耗尽时，腾出 idleFd_ 坑位，用独立 tmp_fd 取出队头连接立刻 close()：
+        //   1) 绝不直接用 idleFd_ 覆盖保存，避免产生无人管理的“孤儿泄漏 fd”且永久丢掉备胎；
+        //   2) 必须凭 accept() 的 tmp_fd >= 0 与 idleFd_ != -1 决定是否继续，
         //      防止 accept 失败而 open 成功时陷入 100% CPU 死循环。
         if (idleFd_ != -1) {
           close(idleFd_);

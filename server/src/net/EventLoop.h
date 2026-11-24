@@ -12,7 +12,7 @@ class Poller;
 class Channel;
 
 // ============================================================================
-// EventLoop：事件驱动心脏 / 火锅店“大堂经理”（One Loop Per Thread 核心）
+// EventLoop：事件驱动心脏（One Loop Per Thread 核心，Main/Sub Reactor 共用）
 //
 // 【所有权与线程边界红线】：
 //   - 独占拥有唯一的 Poller (p_) 与跨线程唤醒门铃 (wakeupFd_ / wakeupChannel_)；

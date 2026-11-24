@@ -17,9 +17,11 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
-#include <string>
 #include <cstdlib>
 #include <fcntl.h>
+#include <memory>
+#include <string>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define CHECK(cond)                                                            \
@@ -145,10 +147,90 @@ static void testNestedQueue() {
   std::printf("PASS nested_queue\n");
 }
 
+// Channel::tie 生命周期守卫：
+// A) readCallback 内释放唯一外部 shared_ptr 时，Channel 栈上 guard 保活到同轮 writeCallback 结束（ASan 零 UAF）
+// B) 绑定对象在 handleEvent 前已销毁时，tie_.lock() 失败应直接跳过回调
+static void testChannelTie() {
+  // Case A
+  {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
+                     sv) == 0);
+
+    struct Owner {
+      Channel ch;
+      bool *destroyedFlag;
+      Owner(EventLoop *loop, int fd, bool *flag)
+          : ch(loop, fd), destroyedFlag(flag) {}
+      ~Owner() { *destroyedFlag = true; }
+    };
+
+    EventLoop loop;
+    bool destroyed = false;
+    bool writeRan = false;
+    auto owner = std::make_shared<Owner>(&loop, sv[0], &destroyed);
+    owner->ch.tie(owner);
+
+    owner->ch.setReadCallback([&] {
+      char buf[64];
+      while (recv(sv[0], buf, sizeof(buf), 0) > 0) {}
+      owner->ch.remove();
+      owner.reset();
+      CHECK(!destroyed);
+    });
+    owner->ch.setWriteCallback([&] {
+      CHECK(!destroyed);
+      writeRan = true;
+      loop.quit();
+    });
+
+    CHECK(owner->ch.enableReading());
+    CHECK(owner->ch.enableWriting());
+    CHECK(write(sv[1], "x", 1) == 1);
+
+    alarm(5);
+    loop.loop();
+    alarm(0);
+
+    CHECK(writeRan && destroyed);
+    close(sv[0]);
+    close(sv[1]);
+  }
+
+  // Case B
+  {
+    int p[2];
+    CHECK(pipe2(p, O_NONBLOCK | O_CLOEXEC) == 0);
+    EventLoop loop;
+    Channel ch(&loop, p[0]);
+    auto token = std::make_shared<int>(42);
+    ch.tie(token);
+
+    int ranCount = 0;
+    ch.setReadCallback([&] { ++ranCount; });
+    CHECK(ch.enableReading());
+    CHECK(write(p[1], "x", 1) == 1);
+    token.reset();
+
+    loop.queueInLoop([&] { loop.quit(); });
+    alarm(5);
+    loop.loop();
+    alarm(0);
+
+    CHECK(ranCount == 0);
+    ch.remove();
+    close(p[0]);
+    close(p[1]);
+  }
+
+  std::printf("PASS channel_tie\n");
+}
+
 int main() {
   std::signal(SIGALRM, onAlarm);
   testDispatchOnce();
   testPendingAfterEvents();
   testNestedQueue();
+  testChannelTie();
   std::printf("ALL PASS\n");
 }

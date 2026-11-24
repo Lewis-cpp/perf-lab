@@ -30,16 +30,14 @@ EventLoop::EventLoop()
   }
 }
 
-// 必须在 .cpp 里定义：让 std::unique_ptr<Poller> 析构时能看到完整的 Poller
-// 类型定义
+// 必须在 .cpp 里定义：让 std::unique_ptr<Poller> 析构时能看到完整的 Poller 类型定义
 EventLoop::~EventLoop() {
   wakeupChannel_->remove();
   ::close(wakeupFd_);
 }
 
 void EventLoop::doPendingFunctors() {
-  // 用 swap 换到栈局部变量，防止回调内部再调 queueInLoop() 时 vector
-  // 扩容导致迭代器失效或吞掉新任务
+  // 锁内 O(1) swap 到栈局部变量、锁外逐个执行：防回调内重入 queueInLoop() 自死锁或迭代器失效
   std::vector<std::function<void()>> tmp;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -54,8 +52,7 @@ void EventLoop::doPendingFunctors() {
 void EventLoop::loop() {
   assertInLoopThread();
   while (!quit_) {
-    // 每轮 poll 前必须清零
-    // size（保留堆容量），防止重放上一轮旧指针或踩到已销毁连接的野指针
+    // 每轮 poll 前清空 size（保留堆容量），防止重放上一轮旧指针
     activeChannels_.clear();
     p_->poll(activeChannels_);
     eventHandling_ = true;
@@ -65,6 +62,9 @@ void EventLoop::loop() {
     eventHandling_ = false;
     doPendingFunctors();
   }
+  // 退出前再收一次信箱：上一批纸条执行期间别的线程递来的任务（如 ~TcpServer 的
+  // connectDestroyed）+ quit() 会让循环直接退出，不收就随 ~EventLoop 丢弃 → assert(closed_)
+  doPendingFunctors();
 }
 
 void EventLoop::quit() {

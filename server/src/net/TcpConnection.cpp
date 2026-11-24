@@ -1,5 +1,6 @@
 #include "net/TcpConnection.h"
 #include "net/EventLoop.h"
+#include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <sys/socket.h>
@@ -13,16 +14,26 @@ TcpConnection::TcpConnection(EventLoop *loop, int fd)
 }
 
 TcpConnection::~TcpConnection() {
-  if (!closed_)
-    channel_.remove();
+  assert(closed_);
   ::close(fd_);
 }
 
+void TcpConnection::connectDestroyed() {
+  loop_->assertInLoopThread();
+  if (!closed_) {
+    closed_ = true;
+    channel_.remove();
+  }
+}
+
 bool TcpConnection::start() {
+  loop_->assertInLoopThread();
+  // 构造完成后首份外部 shared_ptr 已就位，此处可安全调用 shared_from_this()
+  channel_.tie(shared_from_this());
   if (channel_.enableReading())
     return true;
   else {
-    // 挂树失败（从未入 Poller 花名册），置 closed_ 避免析构时冗余调 remove()
+    // 挂树失败（从未入 Poller 花名册），标记 closed_ 使后续 connectDestroyed() 跳过 remove() 且满足析构断言
     closed_ = true;
     return false;
   }
@@ -32,10 +43,13 @@ void TcpConnection::handleClose() {
   if (closed_)
     return;
   closed_ = true;
-  // 先从 Poller 摘除，再通知上层移入轮末回收桶；fd_ 留到析构时才 close
+  // 先在所属 loop_ 线程从 Poller 摘除工牌，再持临时强引用通知 TcpServer 发起跨线程移除；
+  // fd_ 留到最后一个 shared_ptr 销毁 (~TcpConnection) 时再 close，杜绝移除前 fd 号被新连接复用
   channel_.remove();
-  if (closeCallback_)
-    closeCallback_();
+  auto guradThis = shared_from_this();
+  if (closeCallback_) {
+    closeCallback_(guradThis);
+  }
 }
 
 bool TcpConnection::flushOutput() {

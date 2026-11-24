@@ -7,17 +7,18 @@
 class EventLoop;
 
 // ============================================================================
-// Acceptor：门口专职“迎宾员”（接管原 main.cpp 的 listen_fd 创建与分支 A 接客循环）
+// Acceptor：Main Reactor 专职“门口迎宾员”
 //
 // 职责边界：
 //   - 负责创建非阻塞监听套接字 (SO_REUSEADDR + bind + listen)，并在 ET 模式下
 //     循环 accept4() 掏空全连接队列（含 EINTR/ECONNABORTED 重试与 EMFILE 备胎排空）。
-//   - 拿到新连接 conn_fd 后立即通过 NewConnectionCall 回调交给上层，绝不插手后续读写。
+//   - 拿到新连接 conn_fd 后立即通过 NewConnectionCall 回调转交 TcpServer 分发，
+//     绝不插手后续连接生命周期与读写。
 //
 // 【所有权红线】：
 //   - 独占拥有 listenFd_ 与 idleFd_：~Acceptor() 必须先 channel_.remove() 销户，
 //     再关闭 listenFd_ 与 idleFd_。
-//   - 只借用 EventLoop*。
+//   - 只借用所属 Main EventLoop*。
 // ============================================================================
 class Acceptor {
 public:
